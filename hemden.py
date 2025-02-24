@@ -1,0 +1,127 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import torch
+import numpy as np
+import os
+import glob
+import dataclasses
+from typing import Optional
+
+from model import load_tokenizer, load_model
+from fast_detect_gpt import get_sampling_discrepancy_analytic
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+@dataclasses.dataclass
+class DetectorArgs:
+    reference_model_name: str = "falcon-7b"  # Use smaller model by default
+    scoring_model_name: str = "falcon-7b-instruct"
+    device: str = "cpu"
+    cache_dir: str = "../cache"
+
+class FastDetectGPT:
+    def __init__(self, args):
+        self.args = args
+        self.criterion_fn = get_sampling_discrepancy_analytic
+        self.scoring_tokenizer = load_tokenizer(args.scoring_model_name, args.cache_dir)
+        self.scoring_model = load_model(args.scoring_model_name, args.device, args.cache_dir)
+        self.scoring_model.eval()
+        if args.reference_model_name != args.scoring_model_name:
+            self.reference_tokenizer = load_tokenizer(args.reference_model_name, args.cache_dir)
+            self.reference_model = load_model(args.reference_model_name, args.device, args.cache_dir)
+            self.reference_model.eval()
+        
+        # pre-calculated parameters by fitting a LogisticRegression on detection results
+        linear_params = {
+            'gpt-j-6B_gpt-neo-2.7B': (1.87, -2.19),
+            'gpt-neo-2.7B_gpt-neo-2.7B': (1.97, -1.47),
+            'falcon-7b_falcon-7b-instruct': (2.42, -2.83),
+        }
+        key = f'{args.reference_model_name}_{args.scoring_model_name}'
+        self.linear_k, self.linear_b = linear_params[key]
+
+    def compute_crit(self, text):
+        tokenized = self.scoring_tokenizer(text, truncation=True, return_tensors="pt", padding=True, return_token_type_ids=False).to(self.args.device)
+        labels = tokenized.input_ids[:, 1:]
+        with torch.no_grad():
+            logits_score = self.scoring_model(**tokenized).logits[:, :-1]
+            if self.args.reference_model_name == self.args.scoring_model_name:
+                logits_ref = logits_score
+            else:
+                tokenized = self.reference_tokenizer(text, truncation=True, return_tensors="pt", padding=True, return_token_type_ids=False).to(self.args.device)
+                assert torch.all(tokenized.input_ids[:, 1:] == labels), "Tokenizer is mismatch."
+                logits_ref = self.reference_model(**tokenized).logits[:, :-1]
+            crit = self.criterion_fn(logits_ref, logits_score, labels)
+        return crit, labels.size(1)
+
+    def compute_prob(self, text):
+        crit, ntoken = self.compute_crit(text)
+        prob = sigmoid(self.linear_k * crit + self.linear_b)
+        return prob, crit, ntoken
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Fast-DetectGPT API",
+    description="API for detecting machine-generated text using Fast-DetectGPT",
+    version="1.0.0"
+)
+
+# Initialize detector with default arguments
+detector = None
+
+@app.on_event("startup")
+async def startup_event():
+    global detector
+    args = DetectorArgs()
+    detector = FastDetectGPT(args)
+
+# Request/Response Models
+class TextRequest(BaseModel):
+    text: str = Field(..., max_length=2048)
+
+class DetectionResponse(BaseModel):
+    criterion: float
+    probability: float
+    num_tokens: int
+    is_machine_generated: bool
+
+class HealthResponse(BaseModel):
+    status: str
+    detector_loaded: bool
+    device: str
+    reference_model: str
+    scoring_model: str
+
+@app.post("/detect", response_model=DetectionResponse)
+async def detect_machine_generated_text(request: TextRequest):
+    """Detect if the provided text is machine-generated"""
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    try:
+        prob, crit, ntokens = detector.compute_prob(text)
+        return DetectionResponse(
+            criterion=float(crit),
+            probability=float(prob),
+            num_tokens=int(ntokens),
+            is_machine_generated=prob > 0.5
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing text: {str(e)}")
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Check if the service is healthy and detector is loaded"""
+    return HealthResponse(
+        status="healthy",
+        detector_loaded=detector is not None,
+        device=detector.args.device if detector else "unknown",
+        reference_model=detector.args.reference_model_name if detector else "unknown",
+        scoring_model=detector.args.scoring_model_name if detector else "unknown"
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("hemden:app", host="0.0.0.0", port=8000)
