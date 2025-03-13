@@ -2,7 +2,6 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import time
@@ -31,9 +30,35 @@ model_fullnames = {  'gpt2': 'gpt2',
                      'opt-13b': 'facebook/opt-13b',
                      'falcon-7b': 'tiiuae/falcon-7b',
                      'falcon-7b-instruct': 'tiiuae/falcon-7b-instruct',
-                     }
-float16_models = ['gpt-neo-2.7B', 'gpt-j-6B', 'gpt-neox-20b', 'llama-13b', 'llama2-13b', 'bloom-7b1', 'opt-13b',
-                  'falcon-7b', 'falcon-7b-instruct']
+                     
+                     # Nouveaux modèles à ajouter
+                     'llama3-8b': 'meta-llama/Meta-Llama-3-8B',
+                     'phi-2': 'microsoft/phi-2',
+                     'gemma-7b': 'google/gemma-7b',
+                     'mistral-7b': 'mistralai/Mistral-7B-v0.1',
+                     'mistral-7b-instruct': 'mistralai/Mistral-7B-Instruct-v0.1',
+                     
+                     # Modèles DeepSeek
+                     'deepseek-v3-7b': 'deepseek-ai/deepseek-v3-7b',
+                     'deepseek-v3-7b-chat': 'deepseek-ai/deepseek-v3-7b-chat',
+                     'deepseek-v3-34b': 'deepseek-ai/deepseek-v3-34b',
+                     'deepseek-v3-34b-chat': 'deepseek-ai/deepseek-v3-34b-chat',
+                     'deepseek-r1-lite': 'deepseek-ai/deepseek-r1-lite',
+                     'deepseek-r1-lite-chat': 'deepseek-ai/deepseek-r1-lite-chat',
+                     'deepseek-r1-9b': 'deepseek-ai/deepseek-r1-9b',
+                     'deepseek-r1-9b-chat': 'deepseek-ai/deepseek-r1-9b-chat',
+                    }
+
+float16_models = [
+    'gpt-neo-2.7B', 'gpt-j-6B', 'gpt-neox-20b', 
+    'llama-13b', 'llama2-13b', 'bloom-7b1', 'opt-13b',
+    'falcon-7b', 'falcon-7b-instruct',
+    # Nouveaux modèles
+    'llama3-8b', 'gemma-7b', 'mistral-7b', 'mistral-7b-instruct',
+    # Modèles DeepSeek
+    'deepseek-v3-7b', 'deepseek-v3-7b-chat', 'deepseek-v3-34b', 'deepseek-v3-34b-chat', 
+    'deepseek-r1-lite', 'deepseek-r1-lite-chat', 'deepseek-r1-9b', 'deepseek-r1-9b-chat'
+]
 
 def get_model_fullname(model_name):
     return model_fullnames[model_name] if model_name in model_fullnames else model_name
@@ -46,34 +71,49 @@ def load_model(model_name, device, cache_dir):
         model_kwargs.update(dict(torch_dtype=torch.float16))
     if 'gpt-j' in model_name:
         model_kwargs.update(dict(revision='float16'))
+        
+    # Optimisation mémoire pour les grands modèles
+    if any(x in model_name.lower() for x in ['llama', 'falcon', 'mistral', 'bloom', 'deepseek']) and device == 'cuda':
+        model_kwargs.update(dict(device_map='auto'))
+        print("Configuration du device_map='auto' pour ce grand modèle")
+        
     model = from_pretrained(AutoModelForCausalLM, model_fullname, model_kwargs, cache_dir)
-    print('Moving model to GPU...', end='', flush=True)
-    start = time.time()
-    model.to(device)
-    print(f'DONE ({time.time() - start:.2f}s)')
+    
+    # Ne pas déplacer le modèle si device_map est déjà configuré
+    if 'device_map' not in model_kwargs:
+        print('Moving model to GPU...', end='', flush=True)
+        start = time.time()
+        model.to(device)
+        print(f'DONE ({time.time() - start:.2f}s)')
+        
     return model
 
-def load_tokenizer(model_name, cache_dir):
+def load_tokenizer(model_name, cache_dir, dataset=None):
     model_fullname = get_model_fullname(model_name)
     optional_tok_kwargs = {}
     if "facebook/opt-" in model_fullname:
         print("Using non-fast tokenizer for OPT")
         optional_tok_kwargs['fast'] = False
     optional_tok_kwargs['padding_side'] = 'right'
-    base_tokenizer = from_pretrained(AutoTokenizer, model_fullname, optional_tok_kwargs, cache_dir=cache_dir)
+    base_tokenizer = from_pretrained(AutoTokenizer, model_fullname, optional_tok_kwargs, cache_dir)
     if base_tokenizer.pad_token_id is None:
         base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
         if '13b' in model_fullname:
             base_tokenizer.pad_token_id = 0
     return base_tokenizer
 
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default="bloom-7b1")
+    parser.add_argument('--model_name', type=str, default="deepseek-v3-7b")
     parser.add_argument('--cache_dir', type=str, default="../cache")
     args = parser.parse_args()
-
-    load_tokenizer(args.model_name, 'xsum', args.cache_dir)
-    load_model(args.model_name, 'cpu', args.cache_dir)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    tokenizer = load_tokenizer(args.model_name, args.cache_dir)
+    model = load_model(args.model_name, device, args.cache_dir)
+    
+    print(f"Successfully loaded {args.model_name}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e9:.2f}B")
